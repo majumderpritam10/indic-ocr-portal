@@ -144,6 +144,8 @@ def _google(text: str, source, target: str) -> str:
                 break
             except Exception as e:  # noqa: BLE001
                 last = e
+                if type(e).__name__ == "TooManyRequests":   # blocked: retrying only wastes time
+                    raise
                 time.sleep(1.5 * (attempt + 1))
         else:
             raise last
@@ -172,26 +174,33 @@ def _gemini(text: str, source, target: str, cfg: dict) -> str:
     body = {"systemInstruction": {"parts": [{"text": system}]},
             "contents": [{"role": "user", "parts": [{"text": f"<document>\n{text}\n</document>"}]}],
             "generationConfig": {"temperature": 0}}
-    models = [cfg["model"]] if cfg["model"] else ["gemini-flash-latest", "gemini-2.5-flash"]
+    models = [cfg["model"]] if cfg["model"] else ["gemini-flash-latest", "gemini-2.5-flash", "gemini-2.5-flash-lite"]
+    busy = {429, 500, 502, 503, 504}
     last = None
     for m in models:
-        r = requests.post(_GEMINI_URL.format(model=m), json=body, timeout=45,
-                          headers={"x-goog-api-key": cfg["key"], "Content-Type": "application/json"})
-        if r.status_code == 200:
-            try:
-                parts = r.json()["candidates"][0]["content"]["parts"]
-                out = "".join(p.get("text", "") for p in parts).strip()
-            except (KeyError, IndexError, TypeError, ValueError):
-                out = ""
-            if out:
-                return out
-            last = RuntimeError("Gemini returned an empty answer")
-            continue
-        hint = {400: "API key not valid or request rejected", 403: "key not allowed or region not supported",
-                404: "model name not found", 429: "free quota or rate limit reached"}.get(r.status_code, "service error")
-        last = RuntimeError(f"Gemini returned HTTP {r.status_code} ({hint})")
-        if r.status_code != 404:
-            break
+        for attempt in range(2):                      # one quick retry when Google is busy
+            r = requests.post(_GEMINI_URL.format(model=m), json=body, timeout=45,
+                              headers={"x-goog-api-key": cfg["key"], "Content-Type": "application/json"})
+            if r.status_code == 200:
+                try:
+                    parts = r.json()["candidates"][0]["content"]["parts"]
+                    out = "".join(p.get("text", "") for p in parts).strip()
+                except (KeyError, IndexError, TypeError, ValueError):
+                    out = ""
+                if out:
+                    return out
+                last = RuntimeError("Gemini returned an empty answer")
+                break
+            hint = {400: "API key not valid or request rejected", 403: "key not allowed or region not supported",
+                    404: "model name not found", 429: "free quota or rate limit reached",
+                    503: "Google's servers are busy"}.get(r.status_code, "service error")
+            last = RuntimeError(f"Gemini returned HTTP {r.status_code} ({hint})")
+            if r.status_code in (400, 403):           # a key problem: other models will not help
+                raise last
+            if r.status_code in busy and attempt == 0:
+                time.sleep(2)
+                continue
+            break                                     # 404 or still busy: try the next model
     raise last
 
 
@@ -305,8 +314,9 @@ def translate(text: str, source: str | None, target: str, backend: str = "auto")
             if a["letters"] == 0 or a["shares"].get(target, 0) < 0.5:
                 attempts.append(f"{use}: the result was not in {LANGS[target]}, so it was rejected")
                 continue
-        note = ("Earlier back-ends failed, so a fallback was used (" + "; ".join(attempts) + ")") if attempts else ""
-        return {"text": out, "backend": name, "seconds": round(time.time() - t0, 2), "note": note}
+        fallback = ("Another service was used because the first choice failed: " + "; ".join(attempts)) if attempts else ""
+        return {"text": out, "backend": name, "seconds": round(time.time() - t0, 2), "note": "",
+                "fallback_note": fallback}
 
     why = ("; ".join(attempts)) if attempts else "no translation back-end is configured"
     raise TranslationUnavailable(

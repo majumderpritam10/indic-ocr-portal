@@ -319,6 +319,8 @@ def render():
                 if tr["note"]:
                     st.info(tr["note"])
                 st.caption(f"Engine: {tr['backend']} · {tr['seconds']} s")
+                if tr.get("fallback_note"):
+                    st.caption(f"ℹ️ {tr['fallback_note']}")
                 st.code(tr["text"], language=None, wrap_lines=True)
                 st.download_button("⬇ Download Translated Text (TXT)", _txt(tr["text"]),
                                    f"{Path(res['name']).stem}_{target}.txt", "text/plain", key="dl_tr")
