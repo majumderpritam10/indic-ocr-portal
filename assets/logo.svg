@@ -1,0 +1,7 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="320" height="64" viewBox="0 0 320 64">
+  <rect x="4" y="8" width="48" height="48" rx="12" fill="#2f5fd0"/>
+  <path d="M18 20h20l8 8v20a2 2 0 0 1-2 2H18a2 2 0 0 1-2-2V22a2 2 0 0 1 2-2z" fill="#fff"/>
+  <path d="M22 34h20M22 40h14" stroke="#5b3fd6" stroke-width="3" stroke-linecap="round"/>
+  <text x="62" y="29" font-family="Segoe UI, Arial, sans-serif" font-size="19" font-weight="700" fill="#ffffff">Indic Document</text>
+  <text x="62" y="51" font-family="Segoe UI, Arial, sans-serif" font-size="19" font-weight="700" fill="#ffffff">OCR Portal</text>
+</svg>
