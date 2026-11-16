@@ -7,7 +7,7 @@ from PIL import Image
 
 from modules import data_loader as dl
 from modules import ui
-from modules.annotation_visualizer import color_for, draw_boxes, valid_bbox
+from modules.annotation_visualizer import color_for, draw_boxes, draw_tight_boxes, measure_all, valid_bbox
 from modules.paths import LANG_NAMES, resolve
 
 
@@ -63,6 +63,7 @@ def render():
     row = view[view["document_id"] == doc_id].iloc[0]
 
     left, right = st.columns([1, 1.15], gap="large")
+    measured = {}
     records = []
     if not ann.empty:
         records = ann[ann["document_id"] == doc_id].to_dict("records")
@@ -80,10 +81,21 @@ def render():
             fields = sorted({r["field_name"] for r in records})
             show = st.multiselect("Fields to draw", fields, default=fields)
             draw_on = st.toggle("Show bounding boxes", value=True)
+            tight_on = st.toggle("Also show measured tight text boxes (dashed black)", value=False,
+                                 help="Measured by this website from the image pixels. They are NOT part of the dataset; "
+                                      "they show how much of each annotated box the text really fills.")
+            if records:
+                measured = measure_all(pil, records, (int(row["image_width"]), int(row["image_height"])))
             if draw_on and records:
                 shown = [r for r in records if r["field_name"] in show]
                 out, n, scaled = draw_boxes(pil, shown, (int(row["image_width"]), int(row["image_height"])))
+                if tight_on and measured:
+                    idx = {i for i, r in enumerate(records) if r["field_name"] in show}
+                    out = draw_tight_boxes(out, measured, idx)
                 st.image(out, use_container_width=True)
+                if tight_on:
+                    st.caption("Solid coloured boxes = dataset annotations. Dashed black boxes = tight text extent measured "
+                               "from the pixels by this website (approximate; may include the small grey field label).")
                 st.caption(f"{n} box(es) drawn from the annotation file · image {pil.size[0]}×{pil.size[1]} px"
                            + (" · boxes were scaled to match the displayed image size" if scaled else
                               " · box coordinates map 1:1 to the image pixels"))
@@ -91,6 +103,11 @@ def render():
                     f'<span style="background:rgb{color_for(f)};color:#fff;padding:2px 9px;border-radius:6px;font-size:.8rem">{f}</span>'
                     for f in show)
                 st.markdown(chips, unsafe_allow_html=True)
+                if str(doc_id).startswith("INDIC"):
+                    st.caption("ℹ️ These boxes are read from this document's own annotation record. In the synthetic INDIC_* "
+                               "pages the generator placed the 8 fields on the same fixed rows (left edge x = 80), so the layout "
+                               "looks alike from page to page; the box widths, heights and text differ. Open INDIC_0001 and "
+                               "INDIC_0103 to compare, or an EXT_* document, which has a different layout.")
             else:
                 st.image(pil, use_container_width=True)
                 if draw_on and not records:
@@ -122,8 +139,15 @@ def render():
         "LayoutLM bbox (0-1000)": _fmt(r.get("bbox_layoutlm")),
         "YOLO bbox [cx,cy,w,h]": _fmt(r.get("bbox_yolo")),
         "Normalized bbox (0-1)": _fmt(r.get("bbox_norm")),
+        "Text fills box (width × height)": (f"{measured[i]['w_frac']:.0%} × {measured[i]['h_frac']:.0%}" if i in measured else "—"),
         "Changed by normalization": (r.get("text_raw") is not None and r.get("text_raw") != r.get("text")),
-    } for r in records])
+    } for i, r in enumerate(records)])
+    if measured:
+        import statistics
+        st.caption(f"Measured from the image: on this document the text fills a median of "
+                   f"{statistics.median(m['w_frac'] for m in measured.values()):.0%} of each annotated box's width and "
+                   f"{statistics.median(m['h_frac'] for m in measured.values()):.0%} of its height. "
+                   "The boxes are valid and inside the page but looser than the text.")
     st.dataframe(table, use_container_width=True, hide_index=True)
     missing = [r["field_name"] for r in records if not valid_bbox(r.get("bbox"))]
     if missing:

@@ -44,6 +44,52 @@ def _run_translation(res: dict, target: str):
         res["translation_error"] = f"Unexpected translation error: {type(e).__name__}: {e}"
 
 
+def _variants(img, prep, mode):
+    """Images handed to the OCR engine. 'Auto' tries several and keeps the best read."""
+    pre = ("Preprocessed (binarised)", prep["final"])
+    if mode == "Preprocessed image":
+        return [pre]
+    if mode == "Original image":
+        return [("Original image", img)]
+    out = [pre]
+    clahe = next((st_["image"] for st_ in prep["stages"] if st_["name"] == "CLAHE" and st_["ran"]), None)
+    if clahe is not None:
+        out.append(("Contrast-enhanced grayscale (not binarised)", clahe))
+    out.append(("Original image", img))
+    return out
+
+
+def _auto_detect(variants, psm):
+    """Detect bn / hi / en. A first OCR pass reads with all three language packs and the script of the recognised
+    letters is measured. If that pass was unreliable (low engine confidence, i.e. probably garbage), every language is
+    tried on its own and the language whose OCR the engine is most sure about wins."""
+    first = ocr_engine.run_ocr_best(variants, ["bn", "hi", "en"], psm=psm)
+    a = ld.analyse_text(first["text"])
+    conf = first.get("confidence")
+    reliable = a["script"] is not None and a["letters"] >= 3 and (conf is None or conf >= 55)
+    det = {"method": "auto", **a, "probes": None}
+    if reliable:
+        return det
+    img = next((im for n, im in variants if n == first.get("variant")), variants[0][1])
+    probes, best = [], None
+    for code in ("bn", "hi", "en"):
+        r = ocr_engine.run_ocr(img, [code], psm=psm)
+        letters = sum(ch.isalpha() for ch in r["text"])
+        probes.append({"code": code, "confidence": r.get("confidence"), "letters": letters})
+        rk = ocr_engine.rank(r)
+        if best is None or rk > best[0]:
+            best = (rk, code, r)
+    if best[2]["text"].strip():
+        a2 = ld.analyse_text(best[2]["text"])
+        det = {"method": "auto", **a2, "probes": probes}
+        det["script"] = best[1]
+        if best[1] not in det["present"]:
+            det["present"] = [best[1]] + det["present"]
+    else:
+        det["probes"] = probes
+    return det
+
+
 def _process(loaded: dict, data_len: int, opts: dict, source_choice: str, ocr_on: str, psm: int, target: str,
              file_id: str, name: str):
     """The whole pipeline. Returns a result dict (never raises)."""
@@ -57,7 +103,7 @@ def _process(loaded: dict, data_len: int, opts: dict, source_choice: str, ocr_on
         res["m_before"], res["m_after"] = quality_metrics(img), quality_metrics(res["prep"]["final"])
         res["m_before"]["size_bytes"] = data_len
         res["m_after"]["size_bytes"] = len(encode_png(res["prep"]["final"]))
-        ocr_img = res["prep"]["final"] if ocr_on == "Preprocessed image" else img
+        variants = _variants(img, res["prep"], ocr_on)
 
         st.write("③ Detecting script / language…")
         try:
@@ -65,13 +111,12 @@ def _process(loaded: dict, data_len: int, opts: dict, source_choice: str, ocr_on
                 res["detect"] = {"method": "manual", "script": source_choice, "present": [source_choice],
                                  "shares": {}, "letters": 0}
             else:
-                first = ocr_engine.run_ocr(ocr_img, ["bn", "hi", "en"], psm=psm)
-                a = ld.analyse_text(first["text"])
-                if a["script"] is None:
-                    res["detect_error"] = ("No readable letters were found in the first OCR pass, so the script "
-                                           "could not be detected. Choose the document language manually.")
+                det = _auto_detect(variants, psm)
+                if det["script"] is None:
+                    res["detect_error"] = ("No readable letters were found, so the script could not be detected. "
+                                           "Choose the document language manually.")
                 else:
-                    res["detect"] = {"method": "auto", **a}
+                    res["detect"] = det
         except ocr_engine.OcrUnavailable as e:
             res["detect_error"] = str(e)
         except Exception as e:  # noqa: BLE001
@@ -82,7 +127,7 @@ def _process(loaded: dict, data_len: int, opts: dict, source_choice: str, ocr_on
             st.write("④ Running OCR…")
             langs = ld.ocr_languages_for(res["detect"]["script"], res["detect"].get("present"))
             try:
-                res["ocr"] = ocr_engine.run_ocr(ocr_img, langs, psm=psm)
+                res["ocr"] = ocr_engine.run_ocr_best(variants, langs, psm=psm)
                 res["ocr"]["analysis"] = ld.analyse_text(res["ocr"]["text"])
             except ocr_engine.OcrUnavailable as e:
                 res["ocr_error"] = str(e)
@@ -145,8 +190,11 @@ def render():
                 "bilateral": st.checkbox("Bilateral filter", True), "otsu": st.checkbox("Otsu threshold", True),
                 "deskew_on": st.checkbox("Deskew", True),
             }
-            ocr_on = st.radio("Image given to the OCR engine", ["Preprocessed image", "Original image"],
-                              help="Otsu thresholding can hurt photos with uneven lighting; try 'Original image' if the text looks wrong.")
+            ocr_on = st.radio("Image given to the OCR engine",
+                              ["Auto (try several, keep the best)", "Preprocessed image", "Original image"],
+                              help="Auto tries the binarised image, a contrast-enhanced grayscale image and the original, "
+                                   "and keeps the read with the best engine confidence. Otsu thresholding can ruin photos "
+                                   "and handwriting, so Auto is safer.")
             psm = st.selectbox("Page layout mode (Tesseract)", [3, 4, 6, 7, 11], index=0,
                                help="3 = automatic, 4 = single column, 6 = single block, 7 = one line, 11 = sparse text. If a mode finds no text, the others are tried automatically.")
         b1, b2 = st.columns([2, 1])
@@ -231,6 +279,12 @@ def render():
                 st.success(f"Detected language: **{name}**  \nScript share: {share:.1f}% of recognised letters")
                 st.caption("This is a character count (Unicode script analysis of a first OCR pass), not a model "
                            "probability, so no 'confidence %' is claimed.")
+                if det.get("probes"):
+                    pr = ", ".join(f"{ld.language_label(p['code'])}: {p['letters']} letters"
+                                   + (f" at {p['confidence']}%" if p["confidence"] is not None else "")
+                                   for p in det["probes"])
+                    st.caption("The first read was unreliable (low engine confidence), so each language was tried on its "
+                               f"own — {pr}. The language the engine read most reliably was kept.")
         else:
             st.error(res["detect_error"] or "Language detection did not run.")
 
@@ -243,6 +297,11 @@ def render():
         else:
             st.caption(f"Engine: {ocr['backend']} · languages: {ocr['languages']} · {ocr['seconds']} s"
                        + (f" · mean word confidence reported by the engine: {ocr['confidence']}%" if ocr["confidence"] is not None else ""))
+            if len(ocr.get("attempts", [])) > 1 or (ocr.get("attempts") and ocr["variant"] != "Preprocessed (binarised)"):
+                tried = "; ".join(f"{a['variant']}: {a['letters']} letters"
+                                  + (f", confidence {a['confidence']}%" if a["confidence"] is not None else "")
+                                  for a in ocr["attempts"])
+                st.caption(f"Image variants tried → {tried}. Used: **{ocr['variant']}**.")
             if len(ocr.get("psm_tried", [])) > 1:
                 st.caption(f"Page layout modes tried: {', '.join(map(str, ocr['psm_tried']))} — the last one was used.")
             if not ocr["text"].strip():

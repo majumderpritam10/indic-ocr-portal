@@ -44,21 +44,20 @@ Keep API keys in Streamlit "Secrets", never in code.
   annotations are included; Inspector lists only images that exist. To add them, copy the files into `data/augmented/images/`.
 * `scripts/` holds the original pipeline scripts for reference; the website does not run them.
 
-## 6. Reliable translation (Azure Translator, free tier)
-The free Google/MyMemory services can be rate-limited. For translation that works from any phone or computer, add the
-official Azure Translator key (the site uses it automatically, and falls back to the free services if it fails).
+## 6. Reliable translation (free Gemini API key, no credit card)
+The free Google web endpoint and MyMemory are often rate-limited or wrong for Bengali. For translation that works from
+any phone or computer, add a free **Gemini API key**. The site then uses it first and falls back to the free services.
 
-1. Sign in at https://portal.azure.com (students: https://azure.microsoft.com/free/students — no credit card needed).
-2. **Create a resource** → search **Translator** → Create. Pick a resource group (create new), a region (e.g. Central India),
-   a unique name, and pricing tier **Free F0**. Review + create.
-3. Open the resource → **Keys and Endpoint** → copy **KEY 1** and the **Location/Region** (e.g. `centralindia`).
-4. Streamlit Cloud: your app → **Settings → Secrets**, paste:
+1. Open https://aistudio.google.com/apikey and sign in with any Google account.
+2. Click **Create API key** (choose "Create API key in new project" if asked). Copy the key (it starts with `AIza`).
+3. On your PC: in the `.streamlit` folder copy `secrets.toml.example` to `secrets.toml` and put the key in:
 ```
-AZURE_TRANSLATOR_KEY = "paste-key-1-here"
-AZURE_TRANSLATOR_REGION = "centralindia"
+GEMINI_API_KEY = "paste-your-key-here"
+MYMEMORY_EMAIL = "your.email@example.com"
 ```
-   On your own PC: create `.streamlit/secrets.toml` with the same two lines (it is git-ignored, so it is never uploaded).
-5. Save, let the app restart, then translate a document. The result caption shows which service was used.
+4. Streamlit Cloud: your app -> **Settings -> Secrets**, paste the same lines, save.
+5. Translate a document; the caption under the translation shows "Google Gemini API".
 
-The free tier allows about 2 million characters per month; after that the service refuses requests (no charge on F0) and the
-site falls back to the free services. Never commit the key to GitHub.
+Notes: the free tier has daily/per-minute limits (plenty for a demo). Text you translate is sent to Google, so do not
+upload private documents. Never commit the key to GitHub (`secrets.toml` is git-ignored). An Azure Translator key
+(`AZURE_TRANSLATOR_KEY`, `AZURE_TRANSLATOR_REGION`) is also supported if you ever have one; it is tried first.

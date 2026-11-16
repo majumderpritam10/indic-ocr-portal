@@ -123,6 +123,10 @@ def _tesseract_run(image, lang_codes, psm, timeout):
             " in packages.txt; Windows: re-run the Tesseract installer and tick the language) "
             "— the OCR was NOT run, so no text is shown.")
     lang = "+".join(wanted)
+    h0, w0 = image.shape[:2]
+    if max(h0, w0) < 600:   # tiny crops: enlarge so the letters are big enough for Tesseract
+        f = min(4.0, 1200 / max(h0, w0))
+        image = cv2.resize(image, None, fx=f, fy=f, interpolation=cv2.INTER_CUBIC)
     padded = _pad(image)
     tried, text, confs = [], "", []
     for p in [psm] + [x for x in (6, 7, 11) if x != psm]:   # only goes on if the previous mode found nothing
@@ -162,4 +166,38 @@ def run_ocr(image, lang_codes, backend: str = "auto", psm: int = 3, timeout: int
     else:
         raise OcrUnavailable(f"Unknown OCR back-end '{backend}'.")
     res["seconds"] = round(time.time() - t0, 2)
+    return res
+
+
+def rank(res: dict):
+    """Which read is better? Reads the engine itself is unsure about (confidence < 30%, or fewer than 2 letters) are
+    treated as unreliable garbage and always lose to a reliable read, however many letters they contain.
+    Among reliable reads, engine confidence is weighted by how many letters were found."""
+    letters = sum(ch.isalpha() for ch in res.get("text", ""))
+    conf = res["confidence"] if res.get("confidence") is not None else 50.0
+    reliable = conf >= 30 and letters >= 2
+    return (1 if reliable else 0, conf * letters / (letters + 4.0) if reliable else conf)
+
+
+def run_ocr_best(variants, lang_codes, backend: str = "auto", psm: int = 3, timeout: int = 120,
+                 accept_conf: float = 75.0) -> dict:
+    """Try the image variants one after another and keep the best read.
+    `variants` = [(name, image), ...]. Stops early when a read is already good (confidence >= accept_conf with
+    at least 3 letters), so clean scans cost one pass. A team model is run on the first variant only.
+    The result gets 'variant' (the winner) and 'attempts' (what was tried) so the page can show it honestly."""
+    use_team = backend == "team" or (backend == "auto" and team_status()["available"])
+    if use_team:
+        variants = variants[:1]
+    best, attempts = None, []
+    for name, img in variants:
+        res = run_ocr(img, lang_codes, backend, psm, timeout)
+        score = rank(res)
+        letters = sum(ch.isalpha() for ch in res.get("text", ""))
+        attempts.append({"variant": name, "confidence": res.get("confidence"), "letters": letters})
+        if best is None or score > best[0]:
+            best = (score, res, name)
+        if letters >= 3 and (res.get("confidence") or 0) >= accept_conf:
+            break
+    res = best[1]
+    res["variant"], res["attempts"] = best[2], attempts
     return res

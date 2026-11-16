@@ -18,7 +18,7 @@ import numpy as np
 
 from utils.image_utils import encode_png
 
-MAX_DESKEW_DEG = 15.0  # refuse to "correct" larger angles: they are almost always mis-estimates
+MAX_DESKEW_DEG = 10.5  # refuse to "correct" larger angles: they are almost always mis-estimates
 
 
 def to_gray(img: np.ndarray) -> np.ndarray:
@@ -42,23 +42,75 @@ def apply_otsu(gray: np.ndarray) -> np.ndarray:
     return out
 
 
-def estimate_skew(binary: np.ndarray) -> float:
-    """Skew angle in degrees (positive = text is rotated counter-clockwise), via the
-    minimum-area rectangle around the dark (text) pixels — the same idea as the project script."""
-    ys, xs = np.where(binary < 128)
-    if len(xs) < 100:
-        return 0.0
-    if len(xs) > 200_000:  # subsample: the rectangle only depends on the outline
+def _profile_score(mask: np.ndarray, angle: float) -> float:
+    """How 'line-like' the text is after rotating by `angle`: variance of the row sums. It is largest when text
+    lines (and the Bengali/Hindi headline bar) are exactly horizontal."""
+    h, w = mask.shape
+    m = cv2.getRotationMatrix2D((w / 2, h / 2), angle, 1.0)
+    rot = cv2.warpAffine(mask, m, (w, h), flags=cv2.INTER_LINEAR, borderValue=0)
+    return float(np.var(rot.sum(axis=1)))
+
+
+def _count_text_lines(mask: np.ndarray) -> int:
+    """Number of separate horizontal text bands (rows of text) in a boolean text mask."""
+    occupied = mask.sum(axis=1) >= 2
+    bands, run, gap = 0, 0, 0
+    min_gap = max(2, int(0.005 * mask.shape[0]))
+    for v in occupied:
+        if v:
+            run += 1
+            gap = 0
+        else:
+            gap += 1
+            if gap == min_gap and run >= 3:
+                bands += 1
+                run = 0
+    if run >= 3:
+        bands += 1
+    return bands
+
+
+def _estimate_rect(mask: np.ndarray) -> float:
+    """Tilt of the minimum-area rectangle around all text pixels. Exact for page-like blocks with several lines."""
+    ys, xs = np.where(mask)
+    if len(xs) > 200_000:
         idx = np.random.default_rng(0).choice(len(xs), 200_000, replace=False)
         xs, ys = xs[idx], ys[idx]
-    pts = np.column_stack([xs, ys]).astype(np.float32)
-    angle = cv2.minAreaRect(pts)[-1]
-    # OpenCV >= 4.5 reports (0, 90]; fold into (-45, 45]
-    if angle > 45:
+    angle = cv2.minAreaRect(np.column_stack([xs, ys]).astype(np.float32))[-1]
+    if angle > 45:       # OpenCV >= 4.5 reports (0, 90]; fold into (-45, 45]
         angle -= 90
     elif angle <= -45:
         angle += 90
     return float(round(angle, 2))
+
+
+def _estimate_profile(mask: np.ndarray) -> float:
+    """Projection-profile search over -10..+10 degrees; precise for a single word or line."""
+    h, w = mask.shape
+    m = mask.astype(np.float32)
+    s = 500.0 / max(h, w)
+    if s < 1.0:
+        m = cv2.resize(m, (max(1, int(w * s)), max(1, int(h * s))), interpolation=cv2.INTER_AREA)
+    m = cv2.GaussianBlur(m, (0, 0), 1.3)   # fair comparison between re-sampled angles and angle 0
+    base = _profile_score(m, 0.0)
+    coarse = np.arange(-10.0, 10.01, 0.5)
+    best = float(coarse[int(np.argmax([_profile_score(m, float(a)) for a in coarse]))])
+    fine = np.arange(best - 0.5, best + 0.51, 0.1)
+    fscores = [_profile_score(m, float(a)) for a in fine]
+    best = float(fine[int(np.argmax(fscores))])
+    return float(round(best, 2)) if max(fscores) >= base * 1.03 else 0.0
+
+
+def estimate_skew(binary: np.ndarray) -> float:
+    """Skew angle in degrees: the rotation (same sign convention as `deskew`) that makes the text horizontal.
+    Pages with 4 or more text lines use the rectangle method (exact for forms); a single word or a few lines use the
+    projection-profile method (the rectangle method gives wrong angles for a lone word)."""
+    mask = binary < 128
+    if int(mask.sum()) < 100:
+        return 0.0
+    if _count_text_lines(mask) >= 4:
+        return _estimate_rect(mask)
+    return _estimate_profile(mask)
 
 
 def deskew(img: np.ndarray, angle: float) -> np.ndarray:
@@ -111,16 +163,10 @@ def run_pipeline(img: np.ndarray, *, grayscale=True, clahe=True, bilateral=True,
     skew = None
     too_little = False
     if deskew_on:
-        ys, xs = np.where((cur if otsu else apply_otsu(cur)) < 128)
-        if ys.size == 0:
-            too_little = True
-        else:
-            h_txt, w_txt = ys.max() - ys.min() + 1, xs.max() - xs.min() + 1
-            # a single line of text (very wide, very short block) has too little geometry to measure tilt
-            too_little = (w_txt / h_txt) > 5 or h_txt < 0.10 * cur.shape[0] and w_txt < 0.5 * cur.shape[1]
+        too_little = int(np.count_nonzero((cur if otsu else apply_otsu(cur)) < 128)) < 200
     if deskew_on and too_little:
         stages.append({"name": "Deskew", "image": cur, "ran": False,
-                       "note": "Skipped: only a single line / very small block of text was found, which is too little to measure tilt reliably"})
+                       "note": "Skipped: almost no text was found, so the tilt cannot be measured"})
     elif deskew_on:
         if not otsu:
             # skew estimation needs a binary-like picture; use a temporary Otsu copy for measuring only
