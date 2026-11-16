@@ -68,6 +68,14 @@ def home():
     except ImportError:
         rows.append({"Component": "PDF reading (PyMuPDF)", "Working": "❌ no", "Detail": "pip install pymupdf to enable PDF uploads"})
     st.dataframe(pd.DataFrame(rows), hide_index=True, use_container_width=True)
+    with st.expander("🔧 Test the translation services now"):
+        st.caption("Sends one short Bengali word (বাংলাদেশ) to each service separately and shows exactly what each one answers. "
+                   "Takes about 10-20 seconds.")
+        if st.button("Run translation test", key="tr_selftest"):
+            with st.spinner("Testing…"):
+                results = translation_engine.self_test()
+            for row in results:
+                (st.success if row["ok"] else st.error)(f"**{row['name']}** — {row['detail']}")
     st.caption("This table is checked live. The repository itself contains no trained OCR or translation model; "
                "teammates' models plug in through modules/team_ocr_plugin.py and modules/team_translation_plugin.py.")
 

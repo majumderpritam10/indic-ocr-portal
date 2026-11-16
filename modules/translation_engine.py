@@ -161,6 +161,61 @@ def gemini_config():
     return {"key": key, "model": _secret("GEMINI_MODEL")} if key else None
 
 
+_MODELS_URL = "https://generativelanguage.googleapis.com/v1beta/models"
+_MODEL_CACHE = {"t": 0.0, "kh": None, "names": []}
+_GEMINI_FALLBACK = ["gemini-flash-latest", "gemini-2.5-flash", "gemini-2.5-flash-lite", "gemini-2.0-flash"]
+
+
+def rank_gemini_models(names):
+    """From the model names Google lists for this key, pick text models good for translation:
+    '...-latest' alias first, then stable flash models (newest first), flash-lite after, preview/experimental last."""
+    import re
+    skip = ("image", "tts", "live", "audio", "embedding", "robotics", "computer-use", "vision", "imagen", "veo")
+    flash = [n for n in names if "flash" in n and not any(x in n for x in skip)]
+
+    def ver(n):
+        m = re.search(r"gemini-(\d+(?:\.\d+)?)", n)
+        return float(m.group(1)) if m else 0.0
+
+    def key(n):
+        return (0 if "latest" in n else 1, 1 if "lite" in n else 0, -ver(n))
+
+    stable = [n for n in flash if not any(x in n for x in ("preview", "exp"))]
+    other = [n for n in flash if n not in stable]
+    return sorted(stable, key=key) + sorted(other, key=key)
+
+
+def _gemini_candidates(cfg: dict):
+    """Ask Google which models this key can use (so renamed or retired models never break translation).
+    Falls back to a built-in list if the question itself fails. Result is cached for an hour."""
+    import requests
+
+    if cfg["model"]:
+        return [cfg["model"]]
+    kh = hash(cfg["key"])
+    now = time.time()
+    if _MODEL_CACHE["names"] and _MODEL_CACHE["kh"] == kh and now - _MODEL_CACHE["t"] < 3600:
+        return list(_MODEL_CACHE["names"])
+    names = []
+    try:
+        r = requests.get(_MODELS_URL, params={"pageSize": 200}, headers={"x-goog-api-key": cfg["key"]}, timeout=20)
+        if r.status_code == 200:
+            for m in r.json().get("models", []):
+                if "generateContent" in (m.get("supportedGenerationMethods") or []):
+                    names.append(str(m.get("name", "")).split("/")[-1])
+        elif r.status_code in (400, 403):
+            raise RuntimeError(f"Gemini returned HTTP {r.status_code} (API key not valid or not allowed)")
+    except RuntimeError:
+        raise
+    except Exception:  # noqa: BLE001  (network hiccup: use the built-in list)
+        names = []
+    ranked = rank_gemini_models(names)
+    cands = (ranked or _GEMINI_FALLBACK)[:4]
+    if ranked:
+        _MODEL_CACHE.update(t=now, kh=kh, names=cands)
+    return cands
+
+
 def _gemini(text: str, source, target: str, cfg: dict) -> str:
     """Official Gemini API. The model is told to act as a plain translator and to treat the document as data."""
     import requests
@@ -174,7 +229,7 @@ def _gemini(text: str, source, target: str, cfg: dict) -> str:
     body = {"systemInstruction": {"parts": [{"text": system}]},
             "contents": [{"role": "user", "parts": [{"text": f"<document>\n{text}\n</document>"}]}],
             "generationConfig": {"temperature": 0}}
-    models = [cfg["model"]] if cfg["model"] else ["gemini-flash-latest", "gemini-2.5-flash", "gemini-2.5-flash-lite"]
+    models = _gemini_candidates(cfg)
     busy = {429, 500, 502, 503, 504}
     last = None
     for m in models:
@@ -322,3 +377,32 @@ def translate(text: str, source: str | None, target: str, backend: str = "auto")
     raise TranslationUnavailable(
         f"Translation failed ({why}). Free services are often rate-limited — wait a minute and retry, or add a "
         "free Gemini API key (see README, section 'Reliable translation'). No translation was produced.")
+
+
+def self_test() -> list[dict]:
+    """Send one short Bengali word to every service separately and report exactly what each one answers.
+    Used by the 'Test translation' button on the Home page. Never shows a secret (only the first 4 characters of the key)."""
+    rows = []
+    cfg = gemini_config()
+    if cfg is None:
+        rows.append({"name": "Gemini key", "ok": False, "detail": "GEMINI_API_KEY is not set in Secrets."})
+    else:
+        k = cfg["key"]
+        rows.append({"name": "Gemini key", "ok": k.startswith("AIza"),
+                     "detail": f"starts with '{k[:4]}', {len(k)} characters. "
+                               + ("Looks like a normal Google AI Studio key." if k.startswith("AIza") else
+                                  "Google AI Studio keys normally start with 'AIza'. If this one does not, create a new key at "
+                                  "aistudio.google.com/apikey and paste it again (no extra text before it).")})
+        try:
+            _MODEL_CACHE["names"] = []
+            cands = _gemini_candidates(cfg)
+            rows.append({"name": "Gemini models", "ok": True, "detail": "will try: " + ", ".join(cands)})
+        except Exception as e:  # noqa: BLE001
+            rows.append({"name": "Gemini models", "ok": False, "detail": str(e)})
+    for label, backend in (("Gemini translation", "gemini"), ("MyMemory translation", "mymemory"), ("Google web translation", "google")):
+        try:
+            r = translate("বাংলাদেশ", "bn", "en", backend=backend)
+            rows.append({"name": label, "ok": True, "detail": f"answered: {r['text']!r}"})
+        except Exception as e:  # noqa: BLE001
+            rows.append({"name": label, "ok": False, "detail": str(e)[:300]})
+    return rows
